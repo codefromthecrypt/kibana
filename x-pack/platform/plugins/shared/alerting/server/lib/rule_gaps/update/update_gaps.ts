@@ -19,6 +19,9 @@ import { adHocRunStatus } from '../../../../common/constants';
 import { calculateGapStateFromAllBackfills } from './calculate_gaps_state';
 import { updateGapFromSchedule } from './update_gap_from_schedule';
 import { mgetGaps } from '../mget_gaps';
+import { withSpan } from '@kbn/apm-utils';
+import { ScheduledItem, toScheduledItem } from './utils';
+import { clipDateIntervals } from '../gap/interval_utils';
 
 interface UpdateGapsParams {
   ruleId: string;
@@ -36,20 +39,21 @@ interface UpdateGapsParams {
 
 const CONFLICT_STATUS_CODE = 409;
 const MAX_RETRIES = 3;
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 1000;
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 export const prepareGapForUpdate = async (
   gap: Gap,
   {
-    backfillSchedule,
+    scheduledItems,
     savedObjectsRepository,
     shouldRefetchAllBackfills,
     backfillClient,
     actionsClient,
     ruleId,
   }: {
-    backfillSchedule?: BackfillSchedule[];
+    scheduledItems?: ScheduledItem[];
     savedObjectsRepository: ISavedObjectsRepository;
     shouldRefetchAllBackfills?: boolean;
     backfillClient: BackfillClient;
@@ -57,19 +61,21 @@ export const prepareGapForUpdate = async (
     ruleId: string;
   }
 ) => {
-  const hasFailedBackfillTask = backfillSchedule?.some(
+  const hasFailedBackfillTask = scheduledItems?.some(
     (scheduleItem) =>
       scheduleItem.status === adHocRunStatus.ERROR || scheduleItem.status === adHocRunStatus.TIMEOUT
   );
 
-  if (backfillSchedule && !hasFailedBackfillTask) {
-    updateGapFromSchedule({
-      gap,
-      backfillSchedule,
-    });
+  if (scheduledItems && !hasFailedBackfillTask) {
+    await withSpan({ name: 'updateGaps.prepareGapForUpdate.updateGapFromSchedule', type: 'rules' }, async () => {
+      updateGapFromSchedule({
+        gap,
+        scheduledItems,
+      });
+    })
   }
 
-  if (hasFailedBackfillTask || !backfillSchedule || shouldRefetchAllBackfills) {
+  if (hasFailedBackfillTask || !scheduledItems || shouldRefetchAllBackfills) {
     await calculateGapStateFromAllBackfills({
       gap,
       savedObjectsRepository,
@@ -81,6 +87,87 @@ export const prepareGapForUpdate = async (
 
   return gap;
 };
+
+const sortScheduled = (scheduledItems: ScheduledItem[]) => {
+  scheduledItems.sort((a, b) => {
+    const comp = a.from.getTime() - b.from.getTime()
+    if(comp !== 0) {
+      return comp
+    }
+    return a.to.getTime() - b.to.getTime()
+  })
+}
+
+const findEarliestOverlapping = (startMs: number, endMs: number, scheduledItems: ScheduledItem[]) => {
+  let startIdx = 0
+  let endIdx = scheduledItems.length  - 1
+
+  let earliestOverlapping = scheduledItems.length
+
+  while(startIdx <= endIdx) {
+    const midIdx = Math.floor((endIdx - startIdx) / 2) + startIdx
+    const scheduledItem = scheduledItems[midIdx]
+
+    if(endMs < scheduledItem.from.getTime()) {
+      endIdx = midIdx - 1
+      continue
+    }
+
+    if(startMs > scheduledItem.to.getTime()) {
+      startIdx = midIdx + 1
+      continue
+    }
+
+    // There is an overlap at this point
+    earliestOverlapping = Math.min(earliestOverlapping, midIdx)
+    // go left
+    endIdx = midIdx - 1
+  }
+
+  return earliestOverlapping < scheduledItems.length ? earliestOverlapping : null
+
+}
+
+const clipScheduled = (startMs: number, endMs: number, scheduledItem: ScheduledItem) => {
+  const clipped = clipDateIntervals(scheduledItem.from, scheduledItem.to, new Date(startMs), new Date(endMs))
+  if(clipped === null) {
+    throw new Error("Clipped cannot be null!")
+  }
+  scheduledItem.from = clipped.start
+  scheduledItem.to = clipped.end
+} 
+
+const findOverlapping = (startMs: number, endMs: number, scheduledItems: ScheduledItem[]) => {
+  let earliestIdx = findEarliestOverlapping(startMs, endMs, scheduledItems)
+  const overlapping: ScheduledItem[]= []
+  if(!earliestIdx) {
+    return overlapping
+  }
+
+  while(earliestIdx < scheduledItems.length) {
+    const scheduled = scheduledItems[earliestIdx]
+    if(scheduled.from.getTime() > endMs) {
+      break
+    }
+
+    overlapping.push(scheduled)
+    earliestIdx++
+  }
+
+  clipScheduled(startMs, endMs, overlapping[0])
+  clipScheduled(startMs, endMs, overlapping[overlapping.length - 1])
+
+  return overlapping
+}
+
+const findOverlappingIntervals = (gaps: Gap[], scheduledItems: ScheduledItem[]) => {
+  return gaps.map(gap => {
+    return {
+      gap,
+      scheduled: findOverlapping(gap.range.gte.getTime(), gap.range.lte.getTime(), scheduledItems)
+    }
+  })
+}
 
 const updateGapBatch = async (
   gaps: Gap[],
@@ -110,19 +197,22 @@ const updateGapBatch = async (
 ): Promise<boolean> => {
   try {
     // Prepare all gaps for update
-    const updatedGaps = [];
-    for (const gap of gaps) {
-      // we do async request only if there errors in backfill or no backfill schedule
-      const updatedGap = await prepareGapForUpdate(gap, {
-        backfillSchedule,
-        savedObjectsRepository,
-        shouldRefetchAllBackfills,
-        backfillClient,
-        actionsClient,
-        ruleId,
-      });
-      updatedGaps.push(updatedGap);
-    }
+    const updatedGaps: Gap[] = [];
+    const scheduledItems = backfillSchedule?.map(toScheduledItem) ?? []
+    await withSpan({ name: 'updateGaps.prepareGapsForUpdate', type: 'rule' }, async () => {
+      for (const {gap, scheduled} of findOverlappingIntervals(gaps, scheduledItems)) {
+        // we do async request only if there errors in backfill or no backfill schedule
+        const updatedGap = await prepareGapForUpdate(gap, {
+          scheduledItems: scheduled,
+          savedObjectsRepository,
+          shouldRefetchAllBackfills,
+          backfillClient,
+          actionsClient,
+          ruleId,
+        });
+        updatedGaps.push(updatedGap);
+      }
+    })
 
     // Convert gaps to the format expected by updateDocuments
     const gapsToUpdate = updatedGaps
@@ -140,7 +230,11 @@ const updateGapBatch = async (
     }
 
     // Attempt bulk update
-    const bulkResponse = await alertingEventLogger.updateGaps(gapsToUpdate);
+    const bulkResponse = await withSpan(
+      { name: 'updateGaps.alertingEventLogger.updateGaps', type: 'rule' },
+      () => alertingEventLogger.updateGaps(gapsToUpdate)
+    )
+
 
     if (bulkResponse.errors) {
       if (retryCount >= MAX_RETRIES) {
@@ -150,8 +244,7 @@ const updateGapBatch = async (
         return false;
       }
       logger.info(
-        `Retrying update of ${bulkResponse.items.length} gaps due to conflicts. Retry ${
-          retryCount + 1
+        `Retrying update of ${bulkResponse.items.length} gaps due to conflicts. Retry ${retryCount + 1
         } of ${MAX_RETRIES}`
       );
 
@@ -300,8 +393,7 @@ export const updateGaps = async (params: UpdateGapsParams) => {
     }
   } catch (e) {
     logger.error(
-      `Failed to update gaps for rule ${ruleId} from: ${start.toISOString()} to: ${end.toISOString()}: ${
-        e.message
+      `Failed to update gaps for rule ${ruleId} from: ${start.toISOString()} to: ${end.toISOString()}: ${e.message
       }`
     );
   }

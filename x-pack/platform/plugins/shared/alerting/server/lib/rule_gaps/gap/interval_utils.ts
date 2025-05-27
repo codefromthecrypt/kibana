@@ -223,3 +223,15 @@ export const clipInterval = (interval: Interval, boundary: Interval): Interval |
 
   return { gte: new Date(clippedGte), lte: new Date(clippedLte) };
 };
+
+
+export const clipDateIntervals = (start: Date, end: Date, boundaryStart: Date, boundaryEnd: Date): ({start: Date, end: Date } | null) => {
+  const clippedStart = Math.max(start.getTime(), boundaryStart.getTime());
+  const clippedEnd = Math.min(end.getTime(), boundaryEnd.getTime());
+
+  if (clippedStart >= clippedEnd) {
+    return null;
+  }
+
+  return { start: new Date(clippedStart), end: new Date(clippedEnd) };
+}

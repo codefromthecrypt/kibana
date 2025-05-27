@@ -47,6 +47,7 @@ import { createBackfillError } from './lib';
 import { updateGaps } from '../lib/rule_gaps/update/update_gaps';
 import { denormalizeActions } from '../rules_client/lib/denormalize_actions';
 import type { DenormalizedAction, NormalizedAlertActionWithGeneratedValues } from '../rules_client';
+import { withSpan } from '@kbn/apm-utils';
 
 export const BACKFILL_TASK_TYPE = 'ad_hoc_run-backfill';
 
@@ -271,34 +272,36 @@ export class BackfillClient {
       }
     });
 
-    try {
-      // Process backfills in chunks of 10 to manage resource usage
-      for (let i = 0; i < backfillSOs.length; i += 10) {
-        const chunk = backfillSOs.slice(i, i + 10);
-        await Promise.all(
-          chunk.map((backfill) =>
-            updateGaps({
-              backfillSchedule: backfill.schedule,
-              ruleId: backfill.rule.id,
-              start: new Date(backfill.start),
-              end: backfill?.end ? new Date(backfill.end) : new Date(),
-              eventLogger,
-              eventLogClient,
-              savedObjectsRepository: internalSavedObjectsRepository,
-              logger: this.logger,
-              backfillClient: this,
-              actionsClient,
-            })
-          )
+    await withSpan({ name: 'backfillClient.bulkQueue.updateGaps', type: 'rule' }, async () => {
+      try {
+        // Process backfills in chunks of 10 to manage resource usage
+        for (let i = 0; i < backfillSOs.length; i += 10) {
+          const chunk = backfillSOs.slice(i, i + 10);
+          await Promise.all(
+            chunk.map((backfill) =>
+              updateGaps({
+                backfillSchedule: backfill.schedule,
+                ruleId: backfill.rule.id,
+                start: new Date(backfill.start),
+                end: backfill?.end ? new Date(backfill.end) : new Date(),
+                eventLogger,
+                eventLogClient,
+                savedObjectsRepository: internalSavedObjectsRepository,
+                logger: this.logger,
+                backfillClient: this,
+                actionsClient,
+              })
+            )
+          );
+        }
+      } catch {
+        this.logger.warn(
+          `Error updating gaps for backfill jobs: ${backfillSOs
+            .map((backfill) => backfill.id)
+            .join(', ')}`
         );
       }
-    } catch {
-      this.logger.warn(
-        `Error updating gaps for backfill jobs: ${backfillSOs
-          .map((backfill) => backfill.id)
-          .join(', ')}`
-      );
-    }
+    })
 
     if (adHocTasksToSchedule.length > 0) {
       const taskManager = await this.taskManagerStartPromise;
@@ -342,8 +345,8 @@ export class BackfillClient {
             `Error deleting backfill jobs with IDs: ${deleteErrors
               .map((status) => status.id)
               .join(', ')} with errors: ${deleteErrors.map(
-              (status) => status.error?.message
-            )} - jobs and associated task were not deleted.`
+                (status) => status.error?.message
+              )} - jobs and associated task were not deleted.`
           );
         }
 
